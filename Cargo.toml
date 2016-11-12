@@ -1,0 +1,12 @@
+[package]
+name = "memo"
+version = "0.1.0"
+authors = ["Permutator <permutatorem@gmail.com>"]
+license = "MIT"
+readme = "README.md"
+description = """
+A library for simple, easy-to-use memoization, concurrently or in a
+single thread.
+"""
+
+[dependencies]
