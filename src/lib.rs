@@ -1,4 +1,6 @@
 #![feature(atomic_access)]
+#![feature(fn_traits)]
+#![feature(unboxed_closures)]
 
 mod memo;
 mod threadsafe_memo;

@@ -5,8 +5,8 @@ use std::thread::{self, Thread};
 use std::marker::Sync;
 use std::panic::{UnwindSafe, RefUnwindSafe};
 
-const UNCALCULATED: usize = 0;
-const CALCULATING: usize = 1;
+const UNCALCULATED: usize = 1;
+const WORKING: usize = 0; // either calculating or unpoisoning
 const CALCULATED: usize = 2;
 const POISONED: usize = 3;
 const STATE_MASK: usize = 3;
@@ -18,7 +18,7 @@ struct SpinState {
 }
 
 struct Finish<'a> {
-    clean_finish: bool,
+    destination_state: usize,
     state: &'a AtomicUsize,
 }
 
@@ -63,24 +63,24 @@ impl<'a, T, F: FnOnce() -> T> ThreadsafeMemo<T, F> {
                 CALCULATED => return unsafe { Ok((*self.core.get()).value.as_ref().unwrap()) },
                 UNCALCULATED => {
                     if let Err(new_state) = self.state.compare_exchange(UNCALCULATED,
-                                                                        CALCULATING,
+                                                                        WORKING,
                                                                         Ordering::AcqRel,
                                                                         Ordering::Acquire) {
                         state = new_state;
                         continue;
                     }
                     let mut finish = Finish {
-                        clean_finish: false,
+                        destination_state: POISONED,
                         state: &self.state,
                     };
                     let core = unsafe { &mut *self.core.get() };
                     core.value = Some(core.func.take().unwrap()());
                     let out = Ok(core.value.as_ref().unwrap());
-                    finish.clean_finish = true;
+                    finish.destination_state = CALCULATED;
                     return out;
                 },
                 _ => {
-                    assert_eq!(state & STATE_MASK, CALCULATING);
+                    assert_eq!(state & STATE_MASK, WORKING);
                     let mut spin_state = SpinState {
                         thread: thread::current(),
                         signaled: AtomicBool::new(false),
@@ -89,11 +89,11 @@ impl<'a, T, F: FnOnce() -> T> ThreadsafeMemo<T, F> {
                     let spin_state_ptr = &spin_state as *const SpinState as usize;
                     assert_eq!(spin_state_ptr & STATE_MASK, 0);
 
-                    while state & STATE_MASK == CALCULATING {
+                    while state & STATE_MASK == WORKING {
                         spin_state.next = (state & !STATE_MASK) as *const SpinState;
 
                         if let Err(new_state) = self.state.compare_exchange(state,
-                                                                            spin_state_ptr | CALCULATING,
+                                                                            spin_state_ptr | WORKING,
                                                                             Ordering::AcqRel,
                                                                             Ordering::Acquire) {
                             state = new_state;
@@ -137,6 +137,26 @@ impl<'a, T, F: FnOnce() -> T> ThreadsafeMemo<T, F> {
             _ => panic!("ThreadsafeMemo had an invalid state!")
         }
     }
+
+    pub fn unpoison(&self, func: F) -> bool {
+        match self.state.compare_exchange(POISONED,
+                                          WORKING,
+                                          Ordering::AcqRel,
+                                          Ordering::Acquire) {
+            Ok(_) => {
+                let mut finish = Finish {
+                    destination_state: POISONED,
+                    state: &self.state,
+                };
+                let core = unsafe { &mut *self.core.get() };
+                core.func = Some(func);
+                core.value = None;
+                finish.destination_state = UNCALCULATED;
+                true
+            },
+            Err(_) => false,
+        }
+    }
 }
 
 unsafe impl<'a, T, F: FnOnce() -> T> Sync for ThreadsafeMemo<T, F> where T: Sync, F: Sync {  }
@@ -145,9 +165,8 @@ impl<'a, T, F: FnOnce() -> T> RefUnwindSafe for ThreadsafeMemo<T, F> where T: Re
 
 impl<'a> Drop for Finish<'a> {
     fn drop(&mut self) {
-        let state = self.state.swap(if self.clean_finish { CALCULATED } else { POISONED },
-                                    Ordering::Release);
-        assert_eq!(state & STATE_MASK, CALCULATING);
+        let state = self.state.swap(self.destination_state, Ordering::Release);
+        assert_eq!(state & STATE_MASK, WORKING);
 
         let mut head = (state & !STATE_MASK) as *const SpinState;
         while !head.is_null() {
@@ -312,7 +331,8 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
         use std::thread;
-        use std::panic;
+        use std::panic::{self, RefUnwindSafe};
+        use std::time::Duration;
 
         #[test]
         fn stampede() {
@@ -321,6 +341,9 @@ mod tests {
             let memo = {
                 let times = times.clone();
                 Arc::new(ThreadsafeMemo::new(move || {
+                    for _ in 0..3 {
+                        thread::yield_now();
+                    }
                     times.fetch_add(1, Ordering::Release);
                     212
                 }))
@@ -329,7 +352,7 @@ mod tests {
                 let tx = tx.clone();
                 let memo = memo.clone();
                 thread::spawn(move || {
-                    for _ in 0..4 {
+                    for _ in 0..6 {
                         thread::yield_now();
                     }
                     assert_eq!(*memo.get().unwrap(), 212);
@@ -349,6 +372,9 @@ mod tests {
             let memo = {
                 let times = times.clone();
                 Arc::new(ThreadsafeMemo::new(move || {
+                    for _ in 0..3 {
+                        thread::yield_now();
+                    }
                     times.fetch_add(1, Ordering::Release);
                     212
                 }))
@@ -370,29 +396,140 @@ mod tests {
         #[test]
         #[allow(unused_must_use)]
         fn poison() {
-            let (tx, rx) = channel();
-            let memo = ThreadsafeMemo::new(move || {
+            let memo = ThreadsafeMemo::new(|| {
                 panic!();
             });
             panic::catch_unwind(|| {
                 memo.get();
             }).unwrap_err();
             memo.get().unwrap_err();
-            let memo = Arc::new(memo);
-            for _ in 0..12 {
+        }
+
+        #[test]
+        fn poison_race() {
+            let (tx, rx) = channel();
+            let memo = Arc::new(ThreadsafeMemo::new(|| {
+                for _ in 0..3 {
+                    thread::yield_now();
+                }
+                panic!();
+            }));
+            for i in 0..12 {
                 let tx = tx.clone();
                 let memo = memo.clone();
                 thread::spawn(move || {
-                    for _ in 0..4 {
-                        thread::yield_now();
+                    if i >= 6 {
+                        for _ in 0..6 {
+                            thread::yield_now();
+                        }
                     }
                     memo.get().unwrap_err();
                     tx.send(()).unwrap();
                 });
             }
-            for _ in 0..12 {
+            for _ in 0..11 {
                 rx.recv().unwrap();
             }
+            rx.recv_timeout(Duration::from_millis(500)).unwrap_err();
+            memo.get().unwrap_err();
+        }
+
+        struct PoisonCallback {
+            times: Arc<AtomicUsize>,
+            panic: bool,
+            value: u32,
+        }
+
+        impl FnOnce<()> for PoisonCallback {
+            type Output = u32;
+            extern "rust-call" fn call_once(self, _args: ()) -> Self::Output {
+                for _ in 0..3 {
+                    thread::yield_now();
+                }
+                self.times.fetch_add(1, Ordering::SeqCst);
+                if self.panic {
+                    panic!();
+                } else {
+                    self.value
+                }
+            }
+        }
+
+        impl RefUnwindSafe for PoisonCallback {  }
+
+        #[test]
+        #[allow(unused_must_use)]
+        fn unpoison() {
+            let times = Arc::new(AtomicUsize::new(0));
+            let memo = ThreadsafeMemo::new(PoisonCallback {
+                times: times.clone(),
+                panic: true,
+                value: 0,
+            });
+            assert!(!memo.unpoison(PoisonCallback {
+                times: times.clone(),
+                panic: false,
+                value: 0,
+            }));
+            panic::catch_unwind(|| {
+                memo.get();
+            }).unwrap_err();
+            memo.get().unwrap_err();
+            assert!(memo.unpoison(PoisonCallback {
+                times: times.clone(),
+                panic: false,
+                value: 212,
+            }));
+            assert_eq!(*memo.get().unwrap(), 212);
+            assert_eq!(times.load(Ordering::SeqCst), 2);
+        }
+
+        #[test]
+        fn unpoison_race() {
+            let (tx, rx) = channel();
+            let times = Arc::new(AtomicUsize::new(0));
+            let memo = Arc::new(ThreadsafeMemo::new(PoisonCallback {
+                times: times.clone(),
+                panic: true,
+                value: 0,
+            }));
+            for i in 0..12 {
+                let tx = tx.clone();
+                let memo = memo.clone();
+                let times = times.clone();
+                thread::spawn(move || {
+                    if i >= 6 {
+                        for _ in 0..6 {
+                            thread::yield_now();
+                        }
+                    }
+                    let mut got = memo.get();
+                    let mut out = false;
+                    if got.is_err() {
+                        out = memo.unpoison(PoisonCallback {
+                            times: times,
+                            panic: false,
+                            value: 212,
+                        });
+                        got = memo.get();
+                    }
+                    assert_eq!(*got.unwrap(), 212);
+                    tx.send(out).unwrap();
+                });
+            }
+            let mut got_one = false;
+            for _ in 0..11 {
+                let one = rx.recv().unwrap();
+                if one {
+                    if got_one {
+                        panic!();
+                    }
+                    got_one = true;
+                }
+            }
+            assert!(got_one);
+            rx.recv_timeout(Duration::from_millis(500)).unwrap_err();
+            assert_eq!(*memo.get().unwrap(), 212);
         }
     }
 }
