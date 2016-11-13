@@ -148,9 +148,12 @@ impl<'a, T, F: FnOnce() -> T> ThreadsafeMemo<T, F> {
                     destination_state: POISONED,
                     state: &self.state,
                 };
-                let core = unsafe { &mut *self.core.get() };
-                core.func = Some(func);
-                core.value = None;
+                unsafe {
+                    *self.core.get() = ThreadsafeMemoCore {
+                        func: Some(func),
+                        value: None,
+                    };
+                }
                 finish.destination_state = UNCALCULATED;
                 true
             },
