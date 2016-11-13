@@ -613,5 +613,57 @@ mod tests {
             rx.recv_timeout(Duration::from_millis(500)).unwrap_err();
             assert_eq!(*memo.get().unwrap(), 212);
         }
+
+        #[test]
+        fn unpoison_and_unpoison_with_value_race() {
+            let (tx, rx) = channel();
+            let times = Arc::new(AtomicUsize::new(0));
+            let memo = Arc::new(ThreadsafeMemo::new(PoisonCallback {
+                times: times.clone(),
+                panic: true,
+                value: 0,
+            }));
+            for i in 0..12 {
+                let tx = tx.clone();
+                let memo = memo.clone();
+                let times = times.clone();
+                thread::spawn(move || {
+                    if i >= 6 {
+                        for _ in 0..6 {
+                            thread::yield_now();
+                        }
+                    }
+                    let mut got = memo.get();
+                    let mut out = false;
+                    if got.is_err() {
+                        if i & 1 == 0 {
+                            out = memo.unpoison_with_value(212);
+                        } else {
+                            out = memo.unpoison(PoisonCallback {
+                                times: times.clone(),
+                                panic: false,
+                                value: 212,
+                            });
+                        }
+                        got = memo.get();
+                    }
+                    assert_eq!(*got.unwrap(), 212);
+                    tx.send(out).unwrap();
+                });
+            }
+            let mut got_one = false;
+            for _ in 0..11 {
+                let one = rx.recv().unwrap();
+                if one {
+                    if got_one {
+                        panic!();
+                    }
+                    got_one = true;
+                }
+            }
+            assert!(got_one);
+            rx.recv_timeout(Duration::from_millis(500)).unwrap_err();
+            assert_eq!(*memo.get().unwrap(), 212);
+        }
     }
 }
