@@ -197,9 +197,9 @@ impl<'a> Drop for Finish<'a> {
         let mut head = (state & !STATE_MASK) as *const SpinState;
         while !head.is_null() {
             let spin_state = unsafe { &*head };
+            head = spin_state.next;
             spin_state.signaled.store(true, Ordering::Release);
             spin_state.thread.unpark();
-            head = spin_state.next;
         }
     }
 }
