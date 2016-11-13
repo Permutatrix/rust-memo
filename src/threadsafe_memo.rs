@@ -160,6 +160,29 @@ impl<'a, T, F: FnOnce() -> T> ThreadsafeMemo<T, F> {
             Err(_) => false,
         }
     }
+
+    pub fn unpoison_with_value(&self, value: T) -> bool {
+        match self.state.compare_exchange(POISONED,
+                                          WORKING,
+                                          Ordering::AcqRel,
+                                          Ordering::Acquire) {
+            Ok(_) => {
+                let mut finish = Finish {
+                    destination_state: POISONED,
+                    state: &self.state,
+                };
+                unsafe {
+                    *self.core.get() = ThreadsafeMemoCore {
+                        func: None,
+                        value: Some(value),
+                    };
+                }
+                finish.destination_state = CALCULATED;
+                true
+            },
+            Err(_) => false,
+        }
+    }
 }
 
 unsafe impl<'a, T, F: FnOnce() -> T> Sync for ThreadsafeMemo<T, F> where T: Sync, F: Sync {  }
@@ -514,6 +537,62 @@ mod tests {
                             panic: false,
                             value: 212,
                         });
+                        got = memo.get();
+                    }
+                    assert_eq!(*got.unwrap(), 212);
+                    tx.send(out).unwrap();
+                });
+            }
+            let mut got_one = false;
+            for _ in 0..11 {
+                let one = rx.recv().unwrap();
+                if one {
+                    if got_one {
+                        panic!();
+                    }
+                    got_one = true;
+                }
+            }
+            assert!(got_one);
+            rx.recv_timeout(Duration::from_millis(500)).unwrap_err();
+            assert_eq!(*memo.get().unwrap(), 212);
+            assert_eq!(times.load(Ordering::SeqCst), 2);
+        }
+
+        #[test]
+        #[allow(unused_must_use)]
+        fn unpoison_with_value() {
+            let memo = ThreadsafeMemo::new(|| {
+                panic!();
+            });
+            assert!(!memo.unpoison_with_value(0));
+            panic::catch_unwind(|| {
+                memo.get();
+            }).unwrap_err();
+            memo.get().unwrap_err();
+            assert!(memo.unpoison_with_value(212));
+            assert_eq!(*memo.get().unwrap(), 212);
+        }
+
+        #[test]
+        fn unpoison_with_value_race() {
+            let (tx, rx) = channel();
+            let memo = Arc::new(ThreadsafeMemo::new(|| {
+                panic!();
+            }));
+            for i in 0..12 {
+                let tx = tx.clone();
+                let memo = memo.clone();
+                thread::spawn(move || {
+                    if i >= 6 {
+                        for _ in 0..6 {
+                            thread::yield_now();
+                        }
+                    }
+                    let mut got = memo.get();
+                    let mut out = false;
+                    if got.is_err() {
+                        out = memo.unpoison_with_value(212);
                         got = memo.get();
                     }
                     assert_eq!(*got.unwrap(), 212);
