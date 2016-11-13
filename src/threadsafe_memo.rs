@@ -12,9 +12,9 @@ const POISONED: usize = 3;
 const STATE_MASK: usize = 3;
 
 struct SpinState {
-    thread: Thread,
+    thread: Option<Thread>,
     signaled: AtomicBool,
-    next: *const SpinState,
+    next: *mut SpinState,
 }
 
 struct Finish<'a> {
@@ -92,15 +92,15 @@ impl<'a, T, F: FnOnce() -> T> ThreadsafeMemo<T, F> {
                 _ => {
                     assert_eq!(state & STATE_MASK, WORKING);
                     let mut spin_state = SpinState {
-                        thread: thread::current(),
+                        thread: Some(thread::current()),
                         signaled: AtomicBool::new(false),
-                        next: ptr::null(),
+                        next: ptr::null_mut(),
                     };
-                    let spin_state_ptr = &spin_state as *const SpinState as usize;
+                    let spin_state_ptr = &mut spin_state as *mut SpinState as usize;
                     assert_eq!(spin_state_ptr & STATE_MASK, 0);
 
                     while state & STATE_MASK == WORKING {
-                        spin_state.next = (state & !STATE_MASK) as *const SpinState;
+                        spin_state.next = (state & !STATE_MASK) as *mut SpinState;
 
                         if let Err(new_state) = self.state.compare_exchange(state,
                                                                             spin_state_ptr | WORKING,
@@ -204,12 +204,13 @@ impl<'a> Drop for Finish<'a> {
         let state = self.state.swap(self.destination_state, Ordering::Release);
         assert_eq!(state & STATE_MASK, WORKING);
 
-        let mut head = (state & !STATE_MASK) as *const SpinState;
+        let mut head = (state & !STATE_MASK) as *mut SpinState;
         while !head.is_null() {
-            let spin_state = unsafe { &*head };
+            let spin_state = unsafe { &mut *head };
             head = spin_state.next;
+            let thread = spin_state.thread.take().unwrap();
             spin_state.signaled.store(true, Ordering::Release);
-            spin_state.thread.unpark();
+            thread.unpark();
         }
     }
 }
