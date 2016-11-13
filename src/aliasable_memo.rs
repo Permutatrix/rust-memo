@@ -1,45 +1,55 @@
 use std::cell::{Cell, UnsafeCell};
 use memo::Memo;
 
+#[derive(Clone, Copy)]
+enum CalculatingState {
+    Uncalculated,
+    Calculating,
+    Calculated,
+}
+
 pub struct AliasableMemo<T, F: FnOnce() -> T> {
-    calculating: Cell<bool>,
+    calculating_state: Cell<CalculatingState>,
     memo: UnsafeCell<Memo<T, F>>,
 }
 
 impl<T, F: FnOnce() -> T> AliasableMemo<T, F> {
     pub fn new(func: F) -> AliasableMemo<T, F> {
         AliasableMemo {
-            calculating: Cell::new(false),
+            calculating_state: Cell::new(CalculatingState::Uncalculated),
             memo: UnsafeCell::new(Memo::new(func)),
         }
     }
 
     pub fn with_value(value: T) -> AliasableMemo<T, F> {
         AliasableMemo {
-            calculating: Cell::new(false),
+            calculating_state: Cell::new(CalculatingState::Calculated),
             memo: UnsafeCell::new(Memo::with_value(value)),
         }
     }
 }
 
 impl<'a, T, F: FnOnce() -> T> AliasableMemo<T, F> {
-    fn forbid_calculating(&self) {
-        if self.calculating.get() {
-            panic!("AliasableMemo's callback tried to access its own result!");
+    pub fn get(&self) -> &T {
+        match self.try_get() {
+            Some(v) => v,
+            None => {
+                if let CalculatingState::Calculating = self.calculating_state.get() {
+                    panic!("AliasableMemo's callback tried to access its own result!");
+                }
+                self.calculating_state.set(CalculatingState::Calculating);
+                let out = unsafe { (*self.memo.get()).get() };
+                self.calculating_state.set(CalculatingState::Calculated);
+                out
+            },
         }
     }
 
-    pub fn get(&self) -> &T {
-        self.forbid_calculating();
-        self.calculating.set(true);
-        let out = unsafe { (*self.memo.get()).get() };
-        self.calculating.set(false);
-        out
-    }
-
     pub fn try_get(&self) -> Option<&T> {
-        self.forbid_calculating();
-        unsafe { (*self.memo.get()).try_get() }
+        match self.calculating_state.get() {
+            CalculatingState::Uncalculated | CalculatingState::Calculating => None,
+            CalculatingState::Calculated => unsafe { (*self.memo.get()).try_get() },
+        }
     }
 
     pub fn take(self) -> T {
