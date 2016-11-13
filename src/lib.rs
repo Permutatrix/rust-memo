@@ -1,6 +1,5 @@
-#![feature(atomic_access)]
-#![feature(fn_traits)]
-#![feature(unboxed_closures)]
+#![cfg_attr(feature = "unstable", feature(atomic_access))]
+#![cfg_attr(test, feature(fn_traits, unboxed_closures))]
 
 mod memo;
 mod aliasable_memo;

@@ -54,6 +54,16 @@ impl<T, F: FnOnce() -> T> ThreadsafeMemo<T, F> {
     }
 }
 
+#[cfg(feature = "unstable")]
+fn atomic_usize_into_inner(atomic: AtomicUsize) -> usize {
+    atomic.into_inner()
+}
+
+#[cfg(not(feature = "unstable"))]
+fn atomic_usize_into_inner(atomic: AtomicUsize) -> usize {
+    atomic.load(Ordering::Acquire)
+}
+
 impl<'a, T, F: FnOnce() -> T> ThreadsafeMemo<T, F> {
     pub fn get(&self) -> Result<&T, ()> {
         let mut state = self.state.load(Ordering::Acquire);
@@ -121,7 +131,7 @@ impl<'a, T, F: FnOnce() -> T> ThreadsafeMemo<T, F> {
     }
 
     pub fn take(self) -> Result<T, ()> {
-        match (self.state.into_inner(), unsafe { self.core.into_inner() }) {
+        match (atomic_usize_into_inner(self.state), unsafe { self.core.into_inner() }) {
             (POISONED, _) => Err(()),
             (UNCALCULATED, ThreadsafeMemoCore { func: Some(func), value: None }) => Ok(func()),
             (CALCULATED, ThreadsafeMemoCore { func: None, value: Some(value) }) => Ok(value),
@@ -130,7 +140,7 @@ impl<'a, T, F: FnOnce() -> T> ThreadsafeMemo<T, F> {
     }
 
     pub fn try_take(self) -> Result<Option<T>, ()> {
-        match (self.state.into_inner(), unsafe { self.core.into_inner() }) {
+        match (atomic_usize_into_inner(self.state), unsafe { self.core.into_inner() }) {
             (POISONED, _) => Err(()),
             (UNCALCULATED, _) => Ok(None),
             (CALCULATED, ThreadsafeMemoCore { func: None, value: Some(value) }) => Ok(Some(value)),

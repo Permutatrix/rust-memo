@@ -9,4 +9,7 @@ A library for simple, easy-to-use memoization, concurrently or in a
 single thread.
 """
 
+[features]
+unstable = []
+
 [dependencies]
